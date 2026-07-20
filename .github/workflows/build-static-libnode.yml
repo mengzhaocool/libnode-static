@@ -52,6 +52,23 @@ jobs:
         run: |
           git clone https://github.com/nodejs/node --branch ${{ matrix.node_version }} --depth=1 node
 
+      # x86 需要 V8 补丁: marking-state.h:345 MSVC C2352
+      - name: Patch V8 for x86 MSVC
+        if: matrix.arch == 'x86'
+        shell: pwsh
+        run: |
+          $file = "node\deps\v8\src\heap\cppgc\marking-state.h"
+          $content = Get-Content $file -Raw
+          $old = "return MutatorMarkingState::BasicMarkingState::MarkNoPush(header);"
+          $new = "return BasicMarkingState::MarkNoPush(header);"
+          if ($content -match [regex]::Escape($old)) {
+            $content = $content -replace [regex]::Escape($old), $new
+            $content | Set-Content $file -NoNewline
+            Write-Host "Patched marking-state.h: removed redundant class qualifier"
+          } else {
+            Write-Host "WARNING: pattern not found in marking-state.h, skipping patch"
+          }
+
       # 静态构建: 不加 dll flag, libnode.lib 会是真正的静态库
       - name: Build (static)
         shell: pwsh
