@@ -1,5 +1,10 @@
 # libnode 静态库构建工作流
-# 用法: 添加到你的 GitHub 仓库的 .github/workflows/ 目录下，手动触发构建
+# 手动触发, 构建 x64 + x86 静态库, 产物为 libnode_static_{arch}.lib
+#
+# 关键说明:
+# - 不使用 "dll" flag, vcbuild.bat 默认静态构建, libnode.lib 为真正的静态库
+# - x64 用 Node v26, x86 用 Node v22 (v26 已放弃 32 位 Windows)
+# - 合并所有 .lib 为单一静态库 (用 response file 避免命令行过长)
 
 name: Build Static libnode
 
@@ -7,12 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       node_version:
-        description: 'Node.js version (e.g., v26.3.0)'
+        description: 'Node.js version for x64 (e.g., v26.3.0)'
         required: true
         default: 'v26.3.0'
-
-env:
-  NODE_VERSION: ${{ github.event.inputs.node_version }}
 
 jobs:
   build:
@@ -23,9 +25,9 @@ jobs:
         include:
           - arch: x64
             os: windows-2022
-            node_version: v26.3.0
+            node_version: ${{ github.event.inputs.node_version || 'v26.3.0' }}
             vcbuild_arch: x64
-            python_version: '3.x'
+            python_version: '3.12'
           - arch: x86
             os: windows-2022
             node_version: v22.17.0
@@ -46,75 +48,132 @@ jobs:
         run: |
           choco install -y 7zip nasm ninja
 
-      - name: Clone Node.js
+      - name: Clone Node.js ${{ matrix.node_version }}
         run: |
           git clone https://github.com/nodejs/node --branch ${{ matrix.node_version }} --depth=1 node
 
-      - name: Apply v26 patch
-        if: matrix.node_version == 'v26.3.0'
-        shell: pwsh
-        run: |
-          $file = "node\tools\snapshot\node_mksnapshot.cc"
-          $content = Get-Content $file
-          if ($content[0] -notmatch "#undef NODE_SHARED_MODE") {
-            "#undef NODE_SHARED_MODE`n" + ($content -join "`n") | Set-Content $file
-            Write-Host "Applied NODE_SHARED_MODE patch"
-          }
-
-      - name: Build
+      # 静态构建: 不加 dll flag, libnode.lib 会是真正的静态库
+      - name: Build (static)
         shell: pwsh
         run: |
           cd node
-          .\vcbuild.bat ${{ matrix.vcbuild_arch }} dll
+          Write-Host "Building Node.js ${{ matrix.node_version }} ${{ matrix.vcbuild_arch }} (static)..."
+          .\vcbuild.bat release ${{ matrix.vcbuild_arch }}
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "Build failed"
+            Write-Host "Build failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
+          }
+          Write-Host "Build completed successfully"
+
+      - name: Check libnode.lib exists
+        shell: pwsh
+        run: |
+          $libDir = "node\out\Release\lib"
+          if (-not (Test-Path $libDir)) {
+            Write-Host "ERROR: $libDir not found"
+            Get-ChildItem node\out\Release\ | Format-Table Name
+            exit 1
+          }
+          Write-Host "=== Static libs in $libDir ==="
+          Get-ChildItem "$libDir\*.lib" | ForEach-Object {
+            $sizeMB = [math]::Round($_.Length / 1MB, 1)
+            Write-Host ("  {0,-40} {1,8} MB" -f $_.Name, $sizeMB)
+          }
+          $libnodeLib = "$libDir\libnode.lib"
+          if (Test-Path $libnodeLib) {
+            $size = (Get-Item $libnodeLib).Length
+            Write-Host "`nlibnode.lib found: $([math]::Round($size/1MB,1)) MB (static)"
+          } else {
+            Write-Host "`nWARNING: libnode.lib NOT found in $libDir"
+            Write-Host "Will try to find it elsewhere..."
+            Get-ChildItem node\out\Release -Recurse -Filter "libnode.lib" | ForEach-Object {
+              Write-Host "  Found: $($_.FullName) ($([math]::Round($_.Length/1MB,1)) MB)"
+            }
           }
 
       - name: Merge static libs
         shell: pwsh
         run: |
-          cd node\out\Release\lib
+          $libDir = "node\out\Release\lib"
 
-          # 排除的库
-          $exclude = @('gtest', 'v8_nosnapshot', 'v8_init', 'icutools')
+          # 排除的库 (测试/工具用, 不需要)
+          $exclude = @('gtest', 'v8_nosnapshot', 'v8_init', 'icutools', ' torque')
 
           # 收集需要的 .lib 文件
           $libs = @()
-          Get-ChildItem *.lib | ForEach-Object {
+          Get-ChildItem "$libDir\*.lib" | ForEach-Object {
             $name = $_.Name
             $skip = $false
             foreach ($ex in $exclude) {
               if ($name -match $ex) { $skip = $true; break }
             }
-            if (-not $skip) { $libs += $_.FullName }
+            if (-not $skip) { $libs += $name }
           }
 
-          Write-Host "Found $($libs.Count) static libraries:"
-          $libs | ForEach-Object { Write-Host "  $_" }
+          Write-Host "Merging $($libs.Count) static libraries..."
 
-          # 合并为单一静态库
-          $libExe = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\${{ matrix.arch }}\lib.exe"
-          $libExe = (Get-Item $libExe).FullName
+          # 用 vswhere 查找 lib.exe
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -property installationPath
+          $libExe = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\${{ matrix.vcbuild_arch }}\lib.exe" |
+                    Sort-Object { $_.Directory.Parent.Name } -Descending |
+                    Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $libExe -or -not (Test-Path $libExe)) {
+            Write-Host "ERROR: lib.exe not found"
+            Write-Host "VS path: $vsPath"
+            Get-ChildItem "$vsPath\VC\Tools\MSVC" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+            exit 1
+          }
           Write-Host "Using lib.exe: $libExe"
 
-          & $libExe /OUT:..\..\..\..\libnode_static_${{ matrix.arch }}.lib $libs
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Merge failed"
-            exit $LASTEXITCODE
+          # 用 response file 避免命令行过长
+          $outName = "libnode_static_${{ matrix.arch }}.lib"
+          $rspFile = "$libDir\merge.rsp"
+          $rspContent = "/OUT:`"$env:GITHUB_WORKSPACE\$outName`"`n"
+          foreach ($lib in $libs) {
+            $rspContent += "`"$libDir\$lib`"`n"
+          }
+          $rspContent | Set-Content $rspFile -Encoding ascii
+          Write-Host "Response file: $rspFile ($($libs.Count) libs)"
+
+          # 执行合并
+          Push-Location $libDir
+          & $libExe "@merge.rsp"
+          $mergeExit = $LASTEXITCODE
+          Pop-Location
+
+          if ($mergeExit -ne 0) {
+            Write-Host "Merge failed with exit code $mergeExit"
+            exit $mergeExit
           }
 
-          # 复制到 workspace 根目录
-          Copy-Item ..\..\..\..\libnode_static_${{ matrix.arch }}.lib $env:GITHUB_WORKSPACE\
+          $outFile = "$env:GITHUB_WORKSPACE\$outName"
+          if (Test-Path $outFile) {
+            $size = (Get-Item $outFile).Length
+            Write-Host "`nMerged: $outName = $([math]::Round($size/1MB,1)) MB"
+          } else {
+            Write-Host "ERROR: Output file not created"
+            exit 1
+          }
 
       - name: Download headers
         shell: pwsh
         run: |
-          $headersUrl = "https://nodejs.org/dist/${{ env.NODE_VERSION }}/node-${{ env.NODE_VERSION }}-headers.tar.gz"
+          $ver = "${{ matrix.node_version }}"
+          $headersUrl = "https://nodejs.org/dist/$ver/node-$ver-headers.tar.gz"
+          Write-Host "Downloading headers: $headersUrl"
           Invoke-WebRequest -Uri $headersUrl -OutFile headers.tar.gz
           tar -xzf headers.tar.gz
-          Rename-Item node\include libnode-headers
-          7z a -mx9 libnode-headers.zip libnode-headers\
+          $nodeDir = Get-ChildItem -Directory -Filter "node-*" | Select-Object -First 1
+          if ($nodeDir) {
+            Copy-Item -Recurse "$($nodeDir.Name)\include" libnode-headers
+            7z a -mx9 libnode-headers.zip libnode-headers\
+            Write-Host "Headers packed: libnode-headers.zip"
+          } else {
+            Write-Host "ERROR: Could not find extracted node directory"
+            exit 1
+          }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -124,10 +183,20 @@ jobs:
             libnode_static_${{ matrix.arch }}.lib
             libnode-headers.zip
 
-      - name: Verify symbols
+      - name: Verify architecture
         shell: pwsh
         run: |
-          $dumpbin = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\${{ matrix.arch }}\dumpbin.exe"
-          $dumpbin = (Get-Item $dumpbin).FullName
-          & $dumpbin /symbols libnode_static_${{ matrix.arch }}.lib | Select-String "libnode_eval" | Select-Object -First 1
-          & $dumpbin /headers libnode_static_${{ matrix.arch }}.lib | Select-String "machine" | Select-Object -First 1
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\${{ matrix.vcbuild_arch }}\dumpbin.exe" |
+                     Sort-Object { $_.Directory.Parent.Name } -Descending |
+                     Select-Object -First 1 -ExpandProperty FullName
+
+          Write-Host "=== Architecture check ==="
+          & $dumpbin /headers "libnode_static_${{ matrix.arch }}.lib" |
+            Select-String "machine" | Select-Object -First 3
+
+          Write-Host "`n=== Node.js symbols check ==="
+          & $dumpbin /symbols "libnode_static_${{ matrix.arch }}.lib" |
+            Select-String "InitializeOncePerProcess|CreateEnvironment|SpinEventLoop" |
+            Select-Object -First 3
