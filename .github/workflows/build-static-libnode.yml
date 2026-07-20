@@ -23,8 +23,12 @@ jobs:
         include:
           - arch: x64
             os: windows-2022
+            node_version: v26.3.0
+            vcbuild_arch: x64
           - arch: x86
             os: windows-2022
+            node_version: v22.17.0
+            vcbuild_arch: x86
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -42,9 +46,10 @@ jobs:
 
       - name: Clone Node.js
         run: |
-          git clone https://github.com/nodejs/node --branch ${{ env.NODE_VERSION }} --depth=1 node
+          git clone https://github.com/nodejs/node --branch ${{ matrix.node_version }} --depth=1 node
 
       - name: Apply v26 patch
+        if: matrix.node_version == 'v26.3.0'
         shell: pwsh
         run: |
           $file = "node\tools\snapshot\node_mksnapshot.cc"
@@ -58,7 +63,7 @@ jobs:
         shell: pwsh
         run: |
           cd node
-          .\vcbuild.bat ${{ matrix.arch }} dll
+          .\vcbuild.bat ${{ matrix.vcbuild_arch }} dll
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Build failed"
             exit $LASTEXITCODE
