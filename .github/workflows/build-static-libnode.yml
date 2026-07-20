@@ -28,11 +28,12 @@ jobs:
             node_version: ${{ github.event.inputs.node_version || 'v26.3.0' }}
             vcbuild_arch: x64
             python_version: '3.12'
-          - arch: x86
-            os: windows-2022
-            node_version: v22.17.0
-            vcbuild_arch: x86
-            python_version: '3.12'
+          # x86 已成功 (run 29768869875), 暂时跳过
+          # - arch: x86
+          #   os: windows-2022
+          #   node_version: v22.17.0
+          #   vcbuild_arch: x86
+          #   python_version: '3.12'
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -114,9 +115,10 @@ jobs:
           $libDir = "node\out\Release\lib"
 
           # 排除的库 (测试/工具用, 不需要)
-          $exclude = @('gtest', 'v8_nosnapshot', 'v8_init', 'icutools', ' torque')
+          # libnode.lib 也排除: 432MB LTCG 格式, lib.exe 无法合并, 单独提供
+          $exclude = @('gtest', 'v8_nosnapshot', 'v8_init', 'icutools', 'torque', 'libnode')
 
-          # 收集需要的 .lib 文件
+          # 收集需要的 .lib 文件 (排除 libnode.lib)
           $libs = @()
           Get-ChildItem "$libDir\*.lib" | ForEach-Object {
             $name = $_.Name
@@ -127,7 +129,7 @@ jobs:
             if (-not $skip) { $libs += $name }
           }
 
-          Write-Host "Merging $($libs.Count) static libraries..."
+          Write-Host "Merging $($libs.Count) dependency libraries (libnode.lib excluded, provided separately)..."
 
           # 用 vswhere 查找 lib.exe
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -146,7 +148,7 @@ jobs:
 
           # 用 response file 避免命令行过长
           # 关键: Push-Location 后 CWD 已是 lib 目录, 只用文件名
-          $outName = "libnode_static_${{ matrix.arch }}.lib"
+          $outName = "libnode_deps_${{ matrix.arch }}.lib"
           $rspFile = "$libDir\merge.rsp"
           $rspContent = "/OUT:`"$env:GITHUB_WORKSPACE\$outName`"`n"
           foreach ($lib in $libs) {
@@ -169,11 +171,16 @@ jobs:
           $outFile = "$env:GITHUB_WORKSPACE\$outName"
           if (Test-Path $outFile) {
             $size = (Get-Item $outFile).Length
-            Write-Host "`nMerged: $outName = $([math]::Round($size/1MB,1)) MB"
+            Write-Host "`nMerged deps: $outName = $([math]::Round($size/1MB,1)) MB"
           } else {
             Write-Host "ERROR: Output file not created"
             exit 1
           }
+
+          # 复制 libnode.lib 到 workspace (单独提供, 不参与合并)
+          Copy-Item "$libDir\libnode.lib" "$env:GITHUB_WORKSPACE\libnode_${{ matrix.arch }}.lib"
+          $libnodeSize = (Get-Item "$env:GITHUB_WORKSPACE\libnode_${{ matrix.arch }}.lib").Length
+          Write-Host "libnode: libnode_${{ matrix.arch }}.lib = $([math]::Round($libnodeSize/1MB,1)) MB"
 
       - name: Download headers
         shell: pwsh
@@ -198,7 +205,8 @@ jobs:
         with:
           name: libnode-static-${{ matrix.arch }}-windows
           path: |
-            libnode_static_${{ matrix.arch }}.lib
+            libnode_${{ matrix.arch }}.lib
+            libnode_deps_${{ matrix.arch }}.lib
             libnode-headers.zip
 
       - name: Verify architecture
@@ -210,11 +218,11 @@ jobs:
                      Sort-Object { $_.Directory.Parent.Name } -Descending |
                      Select-Object -First 1 -ExpandProperty FullName
 
-          Write-Host "=== Architecture check ==="
-          & $dumpbin /headers "libnode_static_${{ matrix.arch }}.lib" |
+          Write-Host "=== Architecture check (libnode) ==="
+          & $dumpbin /headers "libnode_${{ matrix.arch }}.lib" |
             Select-String "machine" | Select-Object -First 3
 
-          Write-Host "`n=== Node.js symbols check ==="
-          & $dumpbin /symbols "libnode_static_${{ matrix.arch }}.lib" |
+          Write-Host "`n=== Node.js symbols check (libnode) ==="
+          & $dumpbin /symbols "libnode_${{ matrix.arch }}.lib" |
             Select-String "InitializeOncePerProcess|CreateEnvironment|SpinEventLoop" |
             Select-Object -First 3
