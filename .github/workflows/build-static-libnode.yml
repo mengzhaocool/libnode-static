@@ -1,0 +1,126 @@
+# libnode 静态库构建工作流
+# 用法: 添加到你的 GitHub 仓库的 .github/workflows/ 目录下，手动触发构建
+
+name: Build Static libnode
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version (e.g., v26.3.0)'
+        required: true
+        default: 'v26.3.0'
+
+env:
+  NODE_VERSION: ${{ github.event.inputs.node_version }}
+
+jobs:
+  build:
+    name: Static lib ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-2022
+          - arch: x86
+            os: windows-2022
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install -y 7zip nasm ninja
+
+      - name: Clone Node.js
+        run: |
+          git clone https://github.com/nodejs/node --branch ${{ env.NODE_VERSION }} --depth=1 node
+
+      - name: Apply v26 patch
+        shell: pwsh
+        run: |
+          $file = "node\tools\snapshot\node_mksnapshot.cc"
+          $content = Get-Content $file
+          if ($content[0] -notmatch "#undef NODE_SHARED_MODE") {
+            "#undef NODE_SHARED_MODE`n" + ($content -join "`n") | Set-Content $file
+            Write-Host "Applied NODE_SHARED_MODE patch"
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cd node
+          .\vcbuild.bat ${{ matrix.arch }} dll
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Build failed"
+            exit $LASTEXITCODE
+          }
+
+      - name: Merge static libs
+        shell: pwsh
+        run: |
+          cd node\out\Release\lib
+
+          # 排除的库
+          $exclude = @('gtest', 'v8_nosnapshot', 'v8_init', 'icutools')
+
+          # 收集需要的 .lib 文件
+          $libs = @()
+          Get-ChildItem *.lib | ForEach-Object {
+            $name = $_.Name
+            $skip = $false
+            foreach ($ex in $exclude) {
+              if ($name -match $ex) { $skip = $true; break }
+            }
+            if (-not $skip) { $libs += $_.FullName }
+          }
+
+          Write-Host "Found $($libs.Count) static libraries:"
+          $libs | ForEach-Object { Write-Host "  $_" }
+
+          # 合并为单一静态库
+          $libExe = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\${{ matrix.arch }}\lib.exe"
+          $libExe = (Get-Item $libExe).FullName
+          Write-Host "Using lib.exe: $libExe"
+
+          & $libExe /OUT:..\..\..\..\libnode_static_${{ matrix.arch }}.lib $libs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Merge failed"
+            exit $LASTEXITCODE
+          }
+
+          # 复制到 workspace 根目录
+          Copy-Item ..\..\..\..\libnode_static_${{ matrix.arch }}.lib $env:GITHUB_WORKSPACE\
+
+      - name: Download headers
+        shell: pwsh
+        run: |
+          $headersUrl = "https://nodejs.org/dist/${{ env.NODE_VERSION }}/node-${{ env.NODE_VERSION }}-headers.tar.gz"
+          Invoke-WebRequest -Uri $headersUrl -OutFile headers.tar.gz
+          tar -xzf headers.tar.gz
+          Rename-Item node\include libnode-headers
+          7z a -mx9 libnode-headers.zip libnode-headers\
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libnode-static-${{ matrix.arch }}-windows
+          path: |
+            libnode_static_${{ matrix.arch }}.lib
+            libnode-headers.zip
+
+      - name: Verify symbols
+        shell: pwsh
+        run: |
+          $dumpbin = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\*\bin\Hostx64\${{ matrix.arch }}\dumpbin.exe"
+          $dumpbin = (Get-Item $dumpbin).FullName
+          & $dumpbin /symbols libnode_static_${{ matrix.arch }}.lib | Select-String "libnode_eval" | Select-Object -First 1
+          & $dumpbin /headers libnode_static_${{ matrix.arch }}.lib | Select-String "machine" | Select-Object -First 1
