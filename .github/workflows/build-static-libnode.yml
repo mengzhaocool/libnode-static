@@ -145,16 +145,17 @@ jobs:
           Write-Host "Using lib.exe: $libExe"
 
           # 用 response file 避免命令行过长
+          # 关键: Push-Location 后 CWD 已是 lib 目录, 只用文件名
           $outName = "libnode_static_${{ matrix.arch }}.lib"
           $rspFile = "$libDir\merge.rsp"
           $rspContent = "/OUT:`"$env:GITHUB_WORKSPACE\$outName`"`n"
           foreach ($lib in $libs) {
-            $rspContent += "`"$libDir\$lib`"`n"
+            $rspContent += "`"$lib`"`n"
           }
           $rspContent | Set-Content $rspFile -Encoding ascii
           Write-Host "Response file: $rspFile ($($libs.Count) libs)"
 
-          # 执行合并
+          # 执行合并 (CWD = lib 目录, response file 中只有文件名)
           Push-Location $libDir
           & $libExe "@merge.rsp"
           $mergeExit = $LASTEXITCODE
